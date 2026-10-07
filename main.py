@@ -1,256 +1,230 @@
-import asyncio
+import os
+import re
 import logging
-import sqlite3
-from aiohttp import web
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+import psycopg2
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler, 
+    CallbackQueryHandler, ContextTypes, filters
+)
 
-# 🔑 HARDCODED CONFIGURATIONS
-BOT_TOKEN = "8906991132:AAHOomBtHEe55ePedEoEFPoIFBN7Chi6Nks"
-OWNER_ID = 7677244398
-PREMIUM_GROUP_ID = -1003725494113
+# Logging စနစ်
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-logging.basicConfig(level=logging.INFO)
+# ----------------------------------------------------
+# ⚙️ ENVIRONMENT VARIABLES (Render မှ ဖတ်ယူခြင်း)
+# ----------------------------------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+GROUP_ID = int(os.getenv("GROUP_ID", "0"))
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-
-# --- DATABASE SETUP ---
+# ----------------------------------------------------
+# 🐘 POSTGRESQL DATABASE SETUP
+# ----------------------------------------------------
 def init_db():
-    conn = sqlite3.connect("bot_database.db")
-    cursor = conn.cursor()
-    cursor.execute('''
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY,
             username TEXT,
-            code_name TEXT,
-            points INTEGER DEFAULT 0
-        )
+            codename TEXT,
+            points INT DEFAULT 0
+        );
     ''')
     conn.commit()
-    conn.close()
-
-def get_or_create_codename(user_id: int, username: str) -> str:
-    conn = sqlite3.connect("bot_database.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT code_name FROM users WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    
-    if row:
-        code_name = row[0]
-    else:
-        cursor.execute("SELECT COUNT(*) FROM users")
-        count = cursor.fetchone()[0] + 1
-        code_name = f"{count:02d}"
-        cursor.execute("INSERT INTO users (user_id, username, code_name, points) VALUES (?, ?, ?, 0)",
-                       (user_id, username, code_name))
-        conn.commit()
-    conn.close()
-    return code_name
-
-def add_point(user_id: int):
-    conn = sqlite3.connect("bot_database.db")
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET points = points + 10 WHERE user_id = ?", (user_id,))
-    conn.commit()
+    cur.close()
     conn.close()
 
 init_db()
 
-# --- FSM STATES FOR /CA FORM ---
-class CAForm(StatesGroup):
-    target_username = State()
-    target_id = State()
-    violation = State()
-    msg_link = State()
-    deception = State()
-    photo = State()
+def get_or_create_user(user_id: int, username: str):
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute("SELECT codename, points FROM users WHERE user_id = %s;", (user_id,))
+    row = cur.fetchone()
+    if not row:
+        codename = f"VIP-{user_id % 10000:04d}"
+        cur.execute(
+            "INSERT INTO users (user_id, username, codename, points) VALUES (%s, %s, %s, %s);",
+            (user_id, username, codename, 0)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        return codename, 0
+    cur.close()
+    conn.close()
+    return row[0], row[1]
 
-# --- 1. 18+ CONTENT FILTER ---
-NSFW_KEYWORDS = ["18+", "porn", "sex", "hentai", "xxx", "nudity", "အပြာစာပေ", "အပြာကား"]
+def add_points(user_id: int, points_to_add: int):
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET points = points + %s WHERE user_id = %s;", (points_to_add, user_id))
+    conn.commit()
+    cur.close()
+    conn.close()
 
-@dp.message(F.chat.id == PREMIUM_GROUP_ID)
-async def nsfw_filter(message: Message):
-    text = message.text or message.caption or ""
-    if any(keyword in text.lower() for keyword in NSFW_KEYWORDS):
-        await message.delete()
-        user_mention = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
-        await message.answer(f"⚠️ {user_mention} သင်သည် Telegram စည်းကမ်းကို ဒီဂရုထဲတွင် ချိုးဖောက်လို့မရပါ!")
+# ----------------------------------------------------
+# 🤖 BOT COMMANDS & HANDLERS
+# ----------------------------------------------------
+
+# 1. /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    codename, points = get_or_create_user(user.id, user.username or user.first_name)
+    
+    msg = (
+        f"🛡️ **Welcome to CyberShield VIP Bot**\n\n"
+        f"👤 Your CodeName: `{codename}`\n"
+        f"⭐ Your Points: `{points}`\n\n"
+        f"လုံခြုံရေးနှင့် Community စောင့်ရှောက်ရေးအတွက် အသင့်ရှိပါသည်။"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+# 2. /info
+async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    codename, points = get_or_create_user(user.id, user.username or user.first_name)
+    
+    info_text = (
+        f"📊 **User Security Profile**\n"
+        f"• Name: {user.full_name}\n"
+        f"• User ID: `{user.id}`\n"
+        f"• CodeName: `{codename}`\n"
+        f"• Points: `{points}`"
+    )
+    await update.message.reply_text(info_text, parse_mode="Markdown")
+
+# 3. /owner
+async def owner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👑 **CyberShield Bot Owner:** Contact System Administrator directly.")
+    if OWNER_ID:
+        user = update.effective_user
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=f"⚠️ **Owner Alert:** User {user.full_name} (`{user.id}`) used /owner command."
+        )
+
+# 4. /mc (My Code / CodeName)
+async def my_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    codename, _ = get_or_create_user(user.id, user.username or user.first_name)
+    await update.message.reply_text(f"🔑 Your Security CodeName is: `{codename}`", parse_mode="Markdown")
+
+# 5. /ca (Community Alert Form - Owner DM Only)
+async def ca_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != OWNER_ID:
+        return  # Owner မှလွဲ၍ ငြင်းပယ်သည်
+
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("⚠️ ဒီ Command ကို Bot ရဲ့ DM (Private) ထဲတွင်သာ သုံးပါခင်ဗျာ။")
         return
 
-# --- 2. COMMANDS (/start, /info, /owner, /mc) ---
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    await message.reply("🛡️ **CyberShield VIP Bot Activated.**\nPremium Enforcement System Online.")
-
-@dp.message(Command("info"), F.chat.id == PREMIUM_GROUP_ID)
-async def cmd_info(message: Message):
-    user = message.from_user
-    info_text = (
-        "👤 **USER INFORMATION**\n"
-        "➖➖➖➖➖➖➖➖➖➖\n"
-        f"🏷️ **First Name:** {user.first_name}\n"
-        f"🏷️ **Last Name:** {user.last_name or 'N/A'}\n"
-        f"🔗 **Username:** @{user.username or 'No Username'}\n"
-        "🔒 *User ID Hidden for Security Policy*"
-    )
-    await message.reply(info_text, parse_mode="Markdown")
-
-@dp.message(Command("owner"), F.chat.id == PREMIUM_GROUP_ID)
-async def cmd_owner(message: Message):
-    user = message.from_user
-    username_str = f"@{user.username}" if user.username else user.first_name
-    alert_text = f"🚨 **ATTENTION OWNER:**\n\n{username_str} ထို user သည် သင့်ကို Group ထဲတွင်ခေါ်ဆောင်နေပါသည်!"
-    await bot.send_message(chat_id=OWNER_ID, text=alert_text)
-    await message.reply("📩 Owner ထံ အကြောင်းကြားစာ အောင်မြင်စွာ ပို့ပြီးပါပြီ။")
-
-@dp.message(Command("mc"), F.chat.id == PREMIUM_GROUP_ID)
-async def cmd_mc(message: Message):
-    user_id = message.from_user.id
-    username = message.from_user.username or message.from_user.first_name
-    code_name = get_or_create_codename(user_id, username)
-    await message.reply(f"🏷️ **Your Code Name:** `{code_name}`", parse_mode="Markdown")
-
-# --- 3. OWNER ONLY /CA FORM FLOW ---
-@dp.message(Command("CA"), F.from_user.id == OWNER_ID)
-async def start_ca_form(message: Message, state: FSMContext):
-    await message.reply("📝 **Target Username** ကို ရိုက်ထည့်ပါ (ဥပမာ- @scammer_name):")
-    await state.set_state(CAForm.target_username)
-
-@dp.message(CAForm.target_username)
-async def process_target_username(message: Message, state: FSMContext):
-    await state.update_data(target_username=message.text)
-    await message.reply("🆔 **Target ID** ကို ရိုက်ထည့်ပါ:")
-    await state.set_state(CAForm.target_id)
-
-@dp.message(CAForm.target_id)
-async def process_target_id(message: Message, state: FSMContext):
-    await state.update_data(target_id=message.text)
-    await message.reply("⚠️ **Violation (ကျူးလွန်မှု အကြောင်းအရင်း)** ကို ရိုက်ထည့်ပါ:")
-    await state.set_state(CAForm.violation)
-
-@dp.message(CAForm.violation)
-async def process_violation(message: Message, state: FSMContext):
-    await state.update_data(violation=message.text)
-    await message.reply("🔗 **Message Link** ကို ရိုက်ထည့်ပါ:")
-    await state.set_state(CAForm.msg_link)
-
-@dp.message(CAForm.msg_link)
-async def process_msg_link(message: Message, state: FSMContext):
-    await state.update_data(msg_link=message.text)
-    await message.reply("📝 **Deception (လိမ်လည်မှု အသေးစိတ်)** ကို ရိုက်ထည့်ပါ:")
-    await state.set_state(CAForm.deception)
-
-@dp.message(CAForm.deception)
-async def process_deception(message: Message, state: FSMContext):
-    await state.update_data(deception=message.text)
-    await message.reply("📸 **Proof Screenshot (ဓာတ်ပုံ)** ပို့ပေးပါ:")
-    await state.set_state(CAForm.photo)
-
-@dp.message(CAForm.photo, F.photo)
-async def process_photo_and_review(message: Message, state: FSMContext):
-    photo_id = message.photo[-1].file_id
-    await state.update_data(photo=photo_id)
-    data = await state.get_data()
-
-    review_text = (
-        "📋 **COMMUNITY ALERT REVIEW (Owner Only)**\n"
-        "➖➖➖➖➖➖➖➖➖➖\n"
-        f"🎯 **Target Username:** {data['target_username']}\n"
-        f"🆔 **Target ID:** `{data['target_id']}`\n"
-        f"⚠️ **Violation:** {data['violation']}\n"
-        f"🔗 **Message Link:** {data['msg_link']}\n"
-        f"📝 **Deception:** {data['deception']}\n"
-        "➖➖➖➖➖➖➖➖➖➖\n"
-        "📌 အထက်ပါ ဖောင်ကို Premium Group သို့ ပို့ရန် Approve နှိပ်ပါ။"
-    )
-
-    approve_kbd = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="✅ Approve & Broadcast", callback_data="owner_approve_ca")]]
-    )
-
-    await message.answer_photo(photo=photo_id, caption=review_text, parse_mode="Markdown", reply_markup=approve_kbd)
-
-@dp.callback_query(F.data == "owner_approve_ca", F.from_user.id == OWNER_ID)
-async def broadcast_ca_to_group(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    clean_username = data['target_username'].replace("@", "")
-
-    group_card_text = (
-        "🚨 **COMMUNITY ALERT (PREMIUM TEAM)**\n"
-        "➖➖➖➖➖➖➖➖➖➖\n"
-        f"👤 **Target Username:** @{clean_username}\n"
-        f"🆔 **Target ID:** `{data['target_id']}`\n"
-        f"⚠️ **Violation:** {data['violation']}\n"
-        f"🔗 **Message Link:** {data['msg_link']}\n"
-        f"📝 **Deception:** {data['deception']}\n"
-        "➖➖➖➖➖➖➖➖➖➖\n"
-        "📌 **Action Required:** Report တိုင်ကြားရန် အောက်ပါ ခလုတ်ကို နှိပ်ပါ။"
-    )
-
-    action_kbd = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🚨 Report Scammer", url=f"https://t.me/{clean_username}")],
-            [InlineKeyboardButton(text="✅ Confirm Report Done", callback_data=f"confirm_rep_{clean_username}")]
-        ]
-    )
-
-    await bot.send_photo(
-        chat_id=PREMIUM_GROUP_ID,
-        photo=data['photo'],
-        caption=group_card_text,
-        parse_mode="Markdown",
-        reply_markup=action_kbd
-    )
-
-    await callback.message.edit_caption(caption="✅ **Community Alert ကို Premium Group သို့ အောင်မြင်စွာ ပို့ပြီးပါပြီ။**")
-    await state.clear()
-
-# --- 4. MEMBER REPORT CONFIRMATION ---
-@dp.callback_query(F.data.startswith("confirm_rep_"))
-async def member_confirm_report(callback: CallbackQuery):
-    user = callback.from_user
-    username_str = f"@{user.username}" if user.username else user.first_name
-
-    add_point(user.id)
-
-    success_msg = f"✅ Premium user - {username_str} ထို user သည် တိုင်ကြားစာကို အောင်မြင်စွာ တင်ပြီးပါပြီ။"
-    await bot.send_message(chat_id=PREMIUM_GROUP_ID, text=success_msg)
-    await callback.answer("🎉 တိုင်ကြားစာ အတည်ပြုချက် ရရှိပါပြီ (+10 Points)", show_alert=True)
-
-# --- 5. WELCOME & OWNER ALERT ---
-@dp.message(F.new_chat_members, F.chat.id == PREMIUM_GROUP_ID)
-async def welcome_new_member(message: Message):
-    for member in message.new_chat_members:
-        welcome_text = f"👋 **Welcome {member.first_name} to Premium Team!**"
-        await message.reply(welcome_text)
-
-        owner_alert = (
-            "🔔 **NEW MEMBER JOINED GROUP**\n"
-            f"👤 Name: {member.first_name}\n"
-            f"🔗 Username: @{member.username or 'None'}\n"
-            f"🆔 User ID: `{member.id}`"
+    # Form Usage: /ca Username | ID | Violation | Link | Deception
+    text = update.message.text.replace("/ca", "").strip()
+    if not text or "|" not in text:
+        await update.message.reply_text(
+            "⚠️ **`/ca` Form ဖြည့်စွက်နည်း:**\n\n"
+            "`/ca TargetUsername | TargetID | Violation | MessageLink | Deception`\n\n"
+            "ဥပမာ -\n"
+            "`/ca @spammer | 1234567 | Scammer | t.me/xxx/1 | Fake Investment`",
+            parse_mode="Markdown"
         )
-        await bot.send_message(chat_id=OWNER_ID, text=owner_alert, parse_mode="Markdown")
+        return
 
-# --- WEB SERVER FOR RENDER FREE TIER ---
-async def handle(request):
-    return web.Response(text="CyberShield VIP Bot is Live 24/7!")
+    parts = [p.strip() for p in text.split("|")]
+    if len(parts) < 5:
+        await update.message.reply_text("⚠️ Form အချက်အလက် (၅) ချက်စလုံး ပြည့်စုံစွာ ဖြည့်ပေးပါ။")
+        return
 
-async def main():
-    app = web.Application()
-    app.router.add_get('/', handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 10000)
-    await site.start()
+    target_user, target_id, violation, msg_link, deception = parts[0], parts[1], parts[2], parts[3], parts[4]
+
+    alert_msg = (
+        f"🚨 **COMMUNITY ALERT (CA) FORM** 🚨\n"
+        f"------------------------------------\n"
+        f"🎯 **Target User:** {target_user} (`{target_id}`)\n"
+        f"⚠️ **Violation:** {violation}\n"
+        f"🔗 **Message Link:** {msg_link}\n"
+        f"🎭 **Deception:** {deception}\n"
+        f"------------------------------------\n"
+        f"⚡ *CyberShield VIP Admin Enforcement*"
+    )
+
+    keyboard = [[InlineKeyboardButton("🚨 Report Violation", callback_data=f"report_{target_id}_{target_user}")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # Group ထို့ အလိုအလျောက် ပို့ပေးခြင်း
+    if GROUP_ID:
+        await context.bot.send_message(chat_id=GROUP_ID, text=alert_msg, parse_mode="Markdown", reply_markup=reply_markup)
+        await update.message.reply_text("✅ Community Alert Form ကို Group သို့ အောင်မြင်စွာ ပို့ပြီးပါပြီ။")
+
+# 6. Inline Button Handler (Direct Report Clicked)
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data.startswith("report_"):
+        parts = query.data.split("_")
+        target_id, target_user = parts[1], parts[2]
+        reporter = query.from_user
+
+        # Reporter ကို Point ၅ မှတ် ပေးခြင်း
+        add_points(reporter.id, 5)
+        _, new_points = get_or_create_user(reporter.id, reporter.username or reporter.first_name)
+
+        # Confirm & Notification စာတို
+        notify_text = f"✅ {target_user} ထို user သည် တိုင်ကြား ဟု {reporter.full_name} မှ အစီရင်ခံလိုက်ပါသည်။ (Point +5 | Total: {new_points})"
+        await query.message.reply_text(notify_text)
+
+# 7. 18+ Content Auto-Delete
+async def filter_nsfw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    text = update.message.text.lower()
+    nsfw_keywords = ["18+", "porn", "sex", "hentai", "အောစာ", "အောကား"]
     
-    await dp.start_polling(bot)
+    if any(keyword in text for keyword in nsfw_keywords):
+        try:
+            await update.message.delete()
+            warning = await update.message.chat.send_message(
+                f"⚠️ {update.effective_user.mention_html()}, 18+ မက်ဆေ့ဂျ်များကို စနစ်မှ အလိုအလျောက် ဖျက်ဆီးလိုက်ပါသည်။",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logging.error(f"Error deleting NSFW message: {e}")
 
-if __name__ == "__main__":
-    asyncio.run(main())
-                      
+# 8. Welcome Message & Member Alert
+async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    for member in update.message.new_chat_members:
+        await update.message.reply_text(f"👋 မင်္ဂလာပါ {member.full_name}၊ CyberShield Security Group မှ ကြိုဆိုပါသည်!")
+        
+        # Owner DM အကြောင်းကြားခြင်း
+        if OWNER_ID:
+            await context.bot.send_message(
+                chat_id=OWNER_ID,
+                text=f"🔔 **Member Alert:** {member.full_name} (`{member.id}`) ဝင်ရောက်လာပါသည်။"
+            )
+
+# ----------------------------------------------------
+# 🚀 MAIN APPLICATION
+# ----------------------------------------------------
+if __name__ == '__main__':
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("info", info))
+    app.add_handler(CommandHandler("owner", owner))
+    app.add_handler(CommandHandler("mc", my_code))
+    app.add_handler(CommandHandler("ca", ca_form))
+
+    # Callbacks & Messages
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), filter_nsfw))
+
+    app.run_polling()
